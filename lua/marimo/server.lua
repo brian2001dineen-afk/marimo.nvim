@@ -378,13 +378,24 @@ local function fetch_server_token(host, port, file_path, access_token)
 	end
 	local html = ""
 	if vim.system then
-		local out = vim.system({ "curl", "-sf", "--max-time", "3", url }):wait()
+		-- -sL: silent, follow redirects
+		-- -c/-b: cookie jar so the 303 redirect (which strips ?access_token
+		-- for security) carries the session cookie to the target page.
+		local cookie_file = vim.fn.tempname()
+		vim.fn.writefile({}, cookie_file)
+		local out = vim.system({
+			"curl", "-sL", "--max-time", "5",
+			"-c", cookie_file,
+			"-b", cookie_file,
+			url,
+		}):wait()
+		pcall(vim.fn.delete, cookie_file)
 		if out.code ~= 0 then
 			return ""
 		end
 		html = out.stdout or ""
 	else
-		local handle = io.popen(string.format("curl -sf --max-time 3 '%s'", url))
+		local handle = io.popen(string.format("curl -sL --max-time 5 '%s'", url))
 		if not handle then
 			return ""
 		end
@@ -516,6 +527,7 @@ function M.start(file_path, callback)
 		tostring(port),
 		"--token-password",
 		token,
+		"--no-skew-protection",
 		"--watch", -- reload kernel when the file changes on disk (BufWritePost)
 		"--headless",
 	})

@@ -139,29 +139,6 @@ function M:_handle_message(msg)
 		local data = msg.data or {}
 		self.cell_ids = data.cell_ids or {}
 		self._retry_count = 0 -- reset on successful connection
-
-		if not self._kiosk then
-			-- We connected as the main session to create/resume it.  Now
-			-- switch to kiosk mode so the browser can reclaim the main slot
-			-- without being rejected by MARIMO_ALREADY_CONNECTED.
-			self._kiosk = true
-			local on_ready = self._on_ready
-			self:_teardown()
-			self._read_buffer = ""
-			vim.defer_fn(function()
-				if not self.closed then
-					self:connect(function(cell_ids)
-						self.ready = true
-						if on_ready then
-							on_ready(cell_ids)
-						end
-					end)
-				end
-			end, 0)
-			return
-		end
-
-		-- Already in kiosk mode: we are fully connected.
 		self.ready = true
 		vim.defer_fn(function()
 			if self._on_ready then
@@ -262,15 +239,15 @@ function M:connect(on_ready)
 	self._stdout_pipe = stdout_pipe
 	self._stderr_pipe = stderr_pipe
 
-	if not self._kiosk then
-		-- Non-kiosk probe: we never write to the server, so close stdin
-		-- immediately. This lets websocat exit as soon as the server closes
-		-- the connection (MARIMO_ALREADY_CONNECTED or after kernel-ready).
-		stdin_pipe:close()
-		self._stdin_pipe = nil
+	if self._kiosk then
+		-- Kiosk mode: keep stdin open so websocat stays alive and the consumer
+		-- remains registered. The server streams live updates over this connection.
+	else
+		-- Non-kiosk (main) connection: keep stdin open too, so the consumer
+		-- stays registered with EDITOR capabilities (required for HTTP API
+		-- calls like run_cell). The server closes the connection only if a
+		-- browser already holds the main slot (MARIMO_ALREADY_CONNECTED).
 	end
-	-- Kiosk mode: keep stdin open so websocat stays alive and the consumer
-	-- remains registered. The server streams live updates over this connection.
 
 	local received_data = false -- did we get any data before EOF this attempt?
 
@@ -290,8 +267,7 @@ function M:connect(on_ready)
 		else
 			-- EOF: server closed the connection.
 			vim.schedule(function()
-				-- Ignore EOF from a superseded connect() call (e.g. when
-				-- _handle_message intentionally tore down to switch to kiosk).
+				-- Ignore EOF from a superseded connect() call.
 				if self.closed or my_gen ~= self._connect_gen then
 					return
 				end
@@ -309,17 +285,22 @@ function M:connect(on_ready)
 					return
 				end
 
+				-- Non-kiosk (main) disconnect.
 				if not received_data then
-					-- Rejected as non-kiosk: a browser is already connected.
+					-- Rejected immediately: a browser already holds the main slot.
 					-- Switch to kiosk mode for the retry.
 					self._kiosk = true
+					self:_teardown()
+				else
+					-- Unexpected disconnect after connection was established.
+					-- Reconnect as main; keep ready=true so focus_cell keeps working.
+					self:_teardown_kiosk()
 				end
 				self._retry_count = self._retry_count + 1
 				if self._retry_count > 10 then
 					vim.notify("[marimo] gave up reconnecting after 10 attempts", vim.log.levels.WARN)
 					return
 				end
-				self:_teardown()
 				self._read_buffer = ""
 				vim.defer_fn(function()
 					if not self.closed then
